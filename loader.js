@@ -1,4 +1,22 @@
 (() => {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  function openAudio() {
+    if (window.__hcrAudioContext) return;
+    if (window.__hcrEarlyAudio) {
+      if (window.__hcrEarlyAudio.state === 'suspended') window.__hcrEarlyAudio.resume().catch(() => {});
+      return;
+    }
+    try {
+      const ctx = new AC({ latencyHint: 'interactive' });
+      window.__hcrEarlyAudio = ctx;
+      ctx.resume().catch(() => {});
+    } catch (e) {}
+  }
+  if (AC) {
+    addEventListener('pointerdown', openAudio, { capture: true, once: true });
+    addEventListener('keydown', openAudio, { capture: true, once: true });
+    addEventListener('touchstart', openAudio, { capture: true, once: true, passive: true });
+  }
   const ASSETS = {
     'hcr.data': { count: 6, size: 103210907 },
     'hcr.wasm': { count: 6, size: 97394647 },

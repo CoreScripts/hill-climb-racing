@@ -22,6 +22,7 @@
   #fps { font: 12px ui-monospace, monospace; color: var(--dim); background: var(--panel); padding: 4px 8px; border-radius: 7px; display: none; }
   #hint { position: fixed; bottom: 10px; left: 50%; transform: translateX(-50%); font-size: 12px; color: var(--dim); background: var(--panel); padding: 5px 12px; border-radius: 8px; opacity: 0; transition: opacity .4s; pointer-events: none; }
   #hint.show { opacity: 1; }
+  @media (hover: none) { #hud { opacity: 1; } }
 </style></head>
 <body>
 <div id="stage"><canvas id="canvas" width="800" height="600" tabindex="0"></canvas></div>
@@ -104,29 +105,194 @@ window.__hcrMain = () => {
   globalThis.KkeepHcrInput.attach(canvas, {position: pos, emit: ev, ready: () => !!(M && M._hcr_ev_touch)});
   canvas.addEventListener('webglcontextlost', () => { status('The graphics context was lost (GPU reset). Reload the page to continue.'); $('overlay').classList.remove('hidden'); });
 
-  // ---- audio: an AudioWorklet playing the DirectSound mix (jitter buffer; drops backlog beyond 200 ms)
-  const WORKLET = `class HCROut extends AudioWorkletProcessor {
-    constructor() { super(); this.q = []; this.off = 0; this.queued = 0;
-      this.port.onmessage = e => { this.q.push(e.data); this.queued += e.data.length / 2;
-        while (this.queued > sampleRate * 0.2 && this.q.length > 1) { const b = this.q.shift(); this.queued -= b.length / 2 - this.off; this.off = 0; } }; }
-    process(inputs, outputs) { const out = outputs[0], L = out[0], R = out[1] || out[0], n = L.length; let i = 0;
-      while (i < n && this.q.length) { const b = this.q[0], frames = b.length / 2, take = Math.min(n - i, frames - this.off);
-        for (let k = 0; k < take; k++) { L[i + k] = b[(this.off + k) * 2]; R[i + k] = b[(this.off + k) * 2 + 1]; }
-        i += take; this.off += take; this.queued -= take; if (this.off >= frames) { this.q.shift(); this.off = 0; } }
-      for (; i < n; i++) { L[i] = 0; R[i] = 0; }
-      return true; } }
-  registerProcessor('hcr-out', HCROut);`;
+  // ---- audio: AudioWorklet (or ScriptProcessor) with a resampling adaptive jitter buffer
+  class HcrAudioQueue {
+    constructor(outputRate) {
+      this.outputRate = outputRate;
+      this.sourceRate = 48000;
+      this.capacity = 1 << 18;
+      this.mask = this.capacity - 1;
+      this.ring = new Float32Array(this.capacity * 2);
+      this.writeFrame = 0;
+      this.readFrame = 0;
+      this.started = false;
+      this.gotAudio = false;
+      this.fade = 0;
+      this.targetMs = 80;
+      this.safeMs = 60;
+      this.minMs = 60;
+      this.maxMs = 220;
+      this.stableFrames = 0;
+    }
+    setRate(rate) {
+      if (rate > 0 && isFinite(rate)) this.sourceRate = rate;
+    }
+    available() {
+      return this.writeFrame - this.readFrame;
+    }
+    prebuffer() {
+      return Math.max(1, this.targetMs * this.sourceRate / 1000);
+    }
+    push(data) {
+      let frames = data.length >> 1;
+      if (!frames) return;
+      if (!this.gotAudio) {
+        this.gotAudio = true;
+        this.safeMs = Math.min(this.maxMs, Math.max(this.minMs, frames / this.sourceRate * 1000 + 15));
+        this.targetMs = Math.max(this.targetMs, this.safeMs);
+      }
+      if (frames > this.capacity - 2) {
+        data = data.subarray((frames - (this.capacity - 2)) * 2);
+        frames = this.capacity - 2;
+      }
+      const maxQueued = Math.max(200, this.targetMs + 80) * this.sourceRate / 1000;
+      if (this.available() > maxQueued) {
+        this.readFrame = this.writeFrame - maxQueued;
+        this.fade = 0;
+      }
+      if (this.available() + frames > this.capacity - 2) {
+        this.readFrame = Math.max(this.readFrame, this.writeFrame + frames - (this.capacity - 2));
+      }
+      let w = this.writeFrame & this.mask;
+      for (let i = 0; i < frames; i++) {
+        const s = i * 2;
+        this.ring[w * 2] = data[s];
+        this.ring[w * 2 + 1] = data[s + 1];
+        w = (w + 1) & this.mask;
+      }
+      this.writeFrame += frames;
+    }
+    read(L, R, count) {
+      const step = this.sourceRate / this.outputRate;
+      const fadeStep = 1 / Math.max(1, this.outputRate * 0.008);
+      let i = 0;
+      if (!this.started) {
+        if (this.available() < this.prebuffer()) {
+          for (; i < count; i++) { L[i] = 0; if (R) R[i] = 0; }
+          return;
+        }
+        this.started = true;
+        this.fade = 0;
+      }
+      for (; i < count; i++) {
+        if (this.available() < step + 1) {
+          if (this.available() < 1) this.readFrame = this.writeFrame;
+          this.started = false;
+          this.fade = 0;
+          this.targetMs = Math.min(this.maxMs, this.targetMs + 20);
+          this.stableFrames = 0;
+          break;
+        }
+        const base = this.readFrame;
+        const idx = Math.floor(base);
+        const frac = base - idx;
+        const p = (idx & this.mask) * 2;
+        const q = ((idx + 1) & this.mask) * 2;
+        const g = this.fade;
+        L[i] = (this.ring[p] + (this.ring[q] - this.ring[p]) * frac) * g;
+        if (R) R[i] = (this.ring[p + 1] + (this.ring[q + 1] - this.ring[p + 1]) * frac) * g;
+        this.readFrame += step;
+        if (this.fade < 1) this.fade = Math.min(1, this.fade + fadeStep);
+      }
+      for (; i < count; i++) { L[i] = 0; if (R) R[i] = 0; }
+      if (this.started) {
+        this.stableFrames += count;
+        if (this.stableFrames > this.outputRate * 4) {
+          this.stableFrames = 0;
+          if (this.targetMs > this.safeMs) this.targetMs = Math.max(this.safeMs, this.targetMs - 8);
+        }
+      }
+    }
+  }
+
+  const WORKLET = `
+    const HcrAudioQueue = (${HcrAudioQueue.toString()});
+    class HCROut extends AudioWorkletProcessor {
+      constructor() {
+        super();
+        this.q = new HcrAudioQueue(sampleRate);
+        this.port.onmessage = e => {
+          const d = e.data;
+          if (d && d.hcrRate) this.q.setRate(d.hcrRate);
+          else if (d && d.samples) this.q.push(d.samples);
+          else if (d instanceof Float32Array) this.q.push(d);
+        };
+      }
+      process(inputs, outputs) {
+        const out = outputs[0], L = out[0], R = out[1] || null;
+        this.q.read(L, R, L.length);
+        return true;
+      }
+    }
+    registerProcessor('hcr-out', HCROut);`;
+
   async function startAudio(M) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    let ctx;
     try {
-      const ctx = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
-      await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' })));
-      const node = new AudioWorkletNode(ctx, 'hcr-out', { numberOfInputs: 0, outputChannelCount: [2] });
-      node.connect(ctx.destination); M.audioContext = ctx; M.audioNode = node;
-      const resumeAudio = () => { if (ctx.state === 'suspended') ctx.resume().catch(() => {}); };
-      addEventListener('pointerdown', resumeAudio, { once: true });
-      addEventListener('keydown', resumeAudio, { once: true });
-      $('bsound').onclick = () => { const on = ctx.state !== 'running'; if (on) ctx.resume(); else ctx.suspend(); $('bsound').textContent = on ? 'Sound: on' : 'Sound: off'; };
-    } catch (e) { console.warn('[audio] unavailable:', e); $('bsound').textContent = 'Sound: n/a'; }
+      ctx = window.__hcrEarlyAudio || window.__hcrAudioContext || new AC({ latencyHint: 'interactive' });
+      window.__hcrAudioContext = ctx;
+    } catch (e) {
+      try { ctx = new AC(); window.__hcrAudioContext = ctx; } catch (e2) { console.warn('[audio] unavailable:', e2); $('bsound').textContent = 'Sound: n/a'; return; }
+    }
+    let soundOn = true;
+    const resumeAudio = () => { if (soundOn && ctx.state !== 'running') ctx.resume().catch(() => {}); };
+    const updateSound = () => {
+      $('bsound').textContent = ctx.state === 'running' ? 'Sound: on' : soundOn ? 'Sound: tap' : 'Sound: off';
+    };
+    ctx.onstatechange = updateSound;
+    addEventListener('pointerdown', resumeAudio, true);
+    addEventListener('keydown', resumeAudio, true);
+    addEventListener('touchstart', resumeAudio, { capture: true, passive: true });
+    $('bsound').onclick = () => {
+      soundOn = ctx.state !== 'running';
+      if (soundOn) ctx.resume().then(updateSound).catch(() => {});
+      else ctx.suspend().then(updateSound).catch(() => {});
+    };
+    resumeAudio();
+    try {
+      let node = null;
+      if (ctx.audioWorklet && typeof AudioWorkletNode !== 'undefined') {
+        try {
+          const moduleUrl = URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' }));
+          await Promise.race([
+            ctx.audioWorklet.addModule(moduleUrl),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('AudioWorklet timeout')), 2000))
+          ]);
+          node = new AudioWorkletNode(ctx, 'hcr-out', { numberOfInputs: 0, outputChannelCount: [2] });
+          node.connect(ctx.destination);
+        } catch (e) {
+          console.warn('[audio] AudioWorklet failed, falling back to ScriptProcessor:', e);
+          node = null;
+        }
+      }
+      if (!node) {
+        const makeScriptProcessor = ctx.createScriptProcessor || ctx.createJavaScriptNode;
+        if (!makeScriptProcessor) throw new Error('No usable audio output node');
+        const sink = new HcrAudioQueue(ctx.sampleRate);
+        const sp = makeScriptProcessor.call(ctx, 2048, 2, 2);
+        sp.onaudioprocess = e => {
+          const out = e.outputBuffer;
+          sink.read(out.getChannelData(0), out.getChannelData(1) || null, out.length);
+        };
+        sp.connect(ctx.destination);
+        node = {
+          processor: sp,
+          port: {
+            postMessage: d => {
+              if (d && d.hcrRate) sink.setRate(d.hcrRate);
+              else sink.push(d);
+            }
+          }
+        };
+      }
+      M.audioContext = ctx;
+      M.audioNode = node;
+      updateSound();
+    } catch (e) {
+      console.warn('[audio] unavailable:', e);
+      $('bsound').textContent = 'Sound: n/a';
+    }
   }
 
   async function startGame() {

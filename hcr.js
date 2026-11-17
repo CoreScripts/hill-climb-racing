@@ -5658,6 +5658,9 @@ var HCRA = {
 function _hcr_js_audio_init(rate) {
   HCRA.node = Module["audioNode"] || null;
   const ctx = Module["audioContext"];
+  if (HCRA.node && HCRA.node.port && HCRA.node.port.postMessage) {
+    try { HCRA.node.port.postMessage({ hcrRate: rate }); } catch (e) {}
+  }
   if (ctx && ctx.sampleRate !== rate) console.warn(`[audio] mixer renders ${rate} Hz, AudioContext runs at ${ctx.sampleRate} Hz (the worklet resamples)`);
   return HCRA.node ? 1 : 0;
 }
